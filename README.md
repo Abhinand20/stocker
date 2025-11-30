@@ -6,7 +6,7 @@
 
 ### Goals:
 
-- Productionized workflow running periodically, in a containerized environment on the cloud, stored in a PostgreSQL database.
+- Productionized workflow running periodically, in a containerized environment on the cloud, storing data in a PostgreSQL database.
 - Easy discoverablity of data through API endpoints.
 - LLM agent MCP server allowing NL2SQL queries to the data store.
 - Dashboards and visualizations of the data.
