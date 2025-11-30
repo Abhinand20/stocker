@@ -1,19 +1,27 @@
-"""
-Two step scraper:
-1. Fetch all the filing URLs that need to be parsed in this run.
-2. Download the filings and store them for later parsing.
+"""Senate financial filing scraper.
+
+A two-step scraper that:
+1. Fetches filing URLs from the Senate EFD system
+2. Downloads and processes the filing content
 """
 
-from abc import ABC, abstractmethod
-from enum import Enum
-from dataclasses import dataclass
-from typing import List, Optional
-from bs4 import BeautifulSoup
-import re
-from datetime import datetime
-import constants
-import requests
 import logging
+import re
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
+from typing import List, Optional
+
+import requests
+from bs4 import BeautifulSoup
+
+import constants
+
+class FilingFormat(Enum):
+    HTML = "html"
+    PDF = "pdf"
+    UNKNOWN = "unknown"
 
 @dataclass(frozen=True)
 class FilingResult:
@@ -23,6 +31,7 @@ class FilingResult:
     filing_date: datetime
     filing_type: constants.FilingType
     filing_url: str
+    filing_format: FilingFormat
 
 @dataclass
 class FilingSearchFilters:
@@ -41,6 +50,15 @@ class FilingSearchFilters:
         if self.end_date:
             search_params['submitted_end_date'] = self.end_date.strftime("%m/%d/%Y %H:%M:%S")
         return search_params
+
+def parse_filing_format(filing_url: str) -> FilingFormat:
+    if "ptr" in filing_url.lower() or "annual" in filing_url.lower():
+        return FilingFormat.HTML
+    elif "paper" in filing_url.lower():
+        return FilingFormat.PDF
+    else:
+        logging.warning(f"Unknown filing format: {filing_url}")
+        return FilingFormat.UNKNOWN
 
 def parse_filing_type(type_str: str) -> constants.FilingType:
     if "annual report" in type_str.lower():
@@ -61,13 +79,15 @@ def parse_filing_results(results: list[list[str]]) -> list[FilingResult]:
             continue
         filing_url = match.group(1)
         filing_type = parse_filing_type(match.group(2))
+        filing_format = parse_filing_format(filing_url)
         filing_result = FilingResult(
             first_name=row[0].strip(),
             last_name=row[1].strip(),
             office_name=row[2].strip(),
             filing_date=datetime.strptime(row[4], "%m/%d/%Y"),
             filing_type=filing_type,
-            filing_url=filing_url,
+            filing_url=constants.BASE_URL + filing_url,
+            filing_format=filing_format,
         )
         all_results.append(filing_result)
     return all_results
@@ -78,16 +98,37 @@ class Filing(ABC):
         pass
 
     @abstractmethod
-    def get_content(self) -> bytes:
+    def get_content(self, session: requests.Session) -> bytes:
         pass
+
+    @classmethod
+    def from_result(cls, filing_result: FilingResult) -> 'Filing':
+        """
+        Factory method to create FilingHTML or FilingPDF based on the filing_url extension. The URL contains "page" for paper filings and "ptr" for e-filings in HTML format.
+        
+        Args:
+            filing_result: The FilingResult containing the filing URL
+            
+        Returns:
+            FilingHTML or FilingPDF based on filing_url.
+        """
+        url = filing_result.filing_url.lower()
+        if filing_result.filing_format == FilingFormat.HTML:
+            return FilingHTML(filing_result)
+        elif filing_result.filing_format == FilingFormat.PDF:
+            return FilingPDF(filing_result)
+        else:
+            # Default to HTML for unknown extensions
+            logging.warning(f"Unknown file extension in URL: {filing_result.filing_url}, defaulting to HTML")
+            return FilingHTML(filing_result)
 
 class FilingScraper(ABC):
     @abstractmethod
-    def scrape_filing_urls(self, filters: Optional[FilingSearchFilters] = None) -> List[Filing]:
+    def scrape_filing_urls(self, filters: Optional[FilingSearchFilters] = None) -> List[FilingResult]:
         pass
 
     @abstractmethod
-    def download_filing(self, filing: Filing) -> bytes:
+    def download_filing(self, filing: FilingResult) -> bytes:
         pass
 
 # These types of filings are simpler to parse because they are already in a structured format.
@@ -98,8 +139,16 @@ class FilingHTML(Filing):
     def get_url(self) -> str:
         return self.filing_result.filing_url
 
-    def get_content(self) -> bytes:
-        return b""
+    def get_content(self, session: requests.Session) -> bytes:
+        # Fetch the context from the URL, download the HTML.
+        response = session.get(self.get_url())
+        print("Fetching filing URL: ", self.get_url())
+        if response.status_code != 200:
+            raise Exception(f"Failed to fetch filing: {response.status_code}")
+        soup = BeautifulSoup(response.content, "html.parser")
+        print(response.text.strip())
+        print(soup.prettify())
+        return response.content
 
 # These types of filings may need to be parsed using OCR.
 class FilingPDF(Filing):
@@ -109,15 +158,15 @@ class FilingPDF(Filing):
     def get_url(self) -> str:
         return self.filing_result.filing_url
 
-    def get_content(self) -> bytes:
+    def get_content(self, session: requests.Session) -> bytes:
         return b""
 
 
 class SenateFilingScraper(FilingScraper):
     def __init__(self, session: requests.Session):
         self.session = session
-        self.root_url = "https://efdsearch.senate.gov/search/home/"
-        self.search_url = "https://efdsearch.senate.gov/search/report/data/"
+        self.root_url = constants.ROOT_URL
+        self.search_url = constants.SEARCH_URL
         self.search_params = constants.SENATE_FILING_SEARCH_PARAMS.copy()
         self.search_headers = constants.SENATE_FILING_SEARCH_REQUEST_HEADERS.copy()
         self.csrf_token = None
@@ -131,6 +180,14 @@ class SenateFilingScraper(FilingScraper):
         if response.status_code != 200:
             raise Exception(f"Failed to fetch root page: {response.status_code}")
         soup = BeautifulSoup(response.content, "html.parser")
+        self.csrf_token = soup.select_one('[name="csrfmiddlewaretoken"]')["value"]
+        soup = BeautifulSoup(
+        self.session.post(
+            self.root_url,
+            data={"prohibition_agreement": "1", "csrfmiddlewaretoken": self.csrf_token},
+            ).content,
+            "html.parser",
+        )
         self.csrf_token = soup.select_one('[name="csrfmiddlewaretoken"]')["value"]
         self.session.headers.update({"X-CSRFToken": self.csrf_token})
         logging.info(f"Fetched Root page and CSRF token successfully!")
@@ -149,8 +206,11 @@ class SenateFilingScraper(FilingScraper):
         logging.info(f"Fetched {len(all_data)} filings successfully!")
         return all_data
 
-    def download_filing(self, filing: Filing) -> bytes:
-        return b""
+    def download_filing(self, filing: FilingResult) -> bytes:
+        filing = Filing.from_result(filing)
+        logging.info(f"Downloading filing: {filing.get_url()}")
+        c = filing.get_content(self.session)
+        return c
 
 
 def main():
@@ -162,6 +222,11 @@ def main():
         filings = scraper.scrape_filing_urls(filters)
         for filing in filings:
             print(filing)
+            if filing.filing_format == FilingFormat.HTML:
+                c = scraper.download_filing(filing)
+                print(c)
+        
+        # print(f)
     except Exception as e:
         logging.error(f"Failed to scrape filings: {e}")
     finally:

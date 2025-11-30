@@ -1,5 +1,10 @@
 from enum import Enum
 
+BASE_URL = "https://efdsearch.senate.gov"
+ROOT_URL = "https://efdsearch.senate.gov/search/home/"
+SEARCH_URL = "https://efdsearch.senate.gov/search/report/data/"
+
+
 class FilingType(Enum):
     UNKNOWN = "unknown"
     ANNUAL_REPORT = "annual_report"
